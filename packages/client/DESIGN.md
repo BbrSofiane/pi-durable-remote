@@ -23,7 +23,7 @@ At 36×20, all seven recovery rows remain protected: count, eligibility, origina
 
 ## Data boundary
 
-Remote controls are stripped before trusted Markdown/style callbacks. In expanded JSON, original control bytes appear only as inert escaped literals. No repository, credentials or files are read for completion, highlighting or edit previews. No local-file autocomplete, URL opener, custom terminal/layout/editor engine, animation, protocol change, incremental network reducer or disk outbox is introduced. The screenshot's separate server runtime-context issue remains deferred.
+Remote controls are stripped before trusted Markdown/style callbacks. In expanded JSON, original control bytes appear only as inert escaped literals. No repository, credentials or files are read for completion, highlighting or edit previews. No local-file autocomplete, URL opener, custom terminal/layout/editor engine, animation, protocol change, incremental network reducer or disk outbox is introduced. The screenshot's separate server runtime-context issue is implemented server-side: the server supplies this context (configured model, workspace, durable store and diagnostics guidance) from its startup configuration. This adds no client filesystem access and no repository-instruction loading, and no claim is made that the deployed VM has been upgraded.
 
 ## Reproducible frame evidence
 

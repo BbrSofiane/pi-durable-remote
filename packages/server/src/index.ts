@@ -98,12 +98,24 @@ export async function startDurableServer(options: ServerOptions) {
         throw new ServerConfigurationError("Selected model has no usable VM authentication");
       }
     }
+    // Built once per server start from validated, canonical values; stable across requests for prompt caching.
+    const runtimeContext = [
+      "Runtime context for this session:",
+      `- You run on the server host: every tool executes on the machine running this session, not on the connecting client.`,
+      `- Configured model: ${options.model.provider}/${options.model.modelId}. This is fixed at server startup.`,
+      `- Workspace: ${cwd}. You read and edit files there.`,
+      `- Durable conversation store: ${databasePath} (SQLite). This is a distinct role from the workspace: it holds persisted conversation history and survives restarts. The two paths are independent; either placement (inside or outside the workspace) is supported.`,
+      `- An empty workspace does not mean there is no persisted conversation history; history lives in the SQLite store, not in workspace files.`,
+      `- The server manages the store and its live companions ${databasePath}-wal, ${databasePath}-shm and ${databasePath}.lock (write-ahead log, shared memory and session lease). Do not modify or delete these files while the session is running.`,
+      `- Diagnostics: For the documented dedicated user-service deployment: journalctl --user -u pi-durable-remote.service -n 30 --no-pager. When running standalone, diagnostics are the stdout/stderr of the launching process. Do not share logs unredacted; they can contain private details.`,
+    ].join("\n");
     const registry = createRegistry();
     registry.install(CodingTools);
     registry.install(defineExtension({
       name: "remote-coding",
       sections: [
         section("preamble", () => "You are a concise coding assistant. Use read, write, edit, and bash to inspect and change the workspace. Verify changes when practical and report results honestly.", { tag: false }),
+        section("runtime", () => runtimeContext),
         section("cwd", (input) => input.env?.cwd),
       ],
     }));

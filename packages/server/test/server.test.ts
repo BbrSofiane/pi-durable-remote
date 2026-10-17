@@ -1,14 +1,64 @@
 import assert from "node:assert/strict";
-import { readFile, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import test from "node:test";
 import { fauxAssistantMessage, fauxToolCall, InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import type { FauxResponseFactory, TranscriptContext } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import WebSocket from "ws";
 import type { ServerMessage } from "@sof/durable-remote-protocol";
 import { MAX_CLIENT_MESSAGE_BYTES } from "@sof/durable-remote-protocol";
+import type { ConversationId } from "@earendil-works/pi-durable";
 import { ServerConfigurationError, startDurableServer } from "../src/index.ts";
 import { deferred, fixture, Probe, waitUntil } from "./helpers.ts";
+
+/** Replays every system message in order; later messages replace named sections (null removes one). */
+function replaySections(context: TranscriptContext): Record<string, string> {
+  const sections: Record<string, string> = {};
+  for (const message of context.messages) {
+    if (message.role !== "system") continue;
+    for (const [key, value] of Object.entries(message.sections ?? {})) {
+      if (value === null) delete sections[key];
+      else sections[key] = value;
+    }
+  }
+  return sections;
+}
+
+/** Records each context and echoes the latest user text so every submission settles with a unique marker. */
+const recorder = (contexts: TranscriptContext[]): FauxResponseFactory => (context) => {
+  contexts.push(context);
+  const lastUser = [...context.messages].reverse().find((message) => message.role === "user");
+  const prompt = typeof lastUser?.content === "string" ? lastUser.content : lastUser?.content.find((block) => block.type === "text")?.text ?? "";
+  return fauxAssistantMessage(prompt);
+};
+
+async function submitAndSettle(client: Probe, conversationId: ConversationId, id: string): Promise<void> {
+  const marker = `ack ${id}`;
+  const after = client.frames.length;
+  client.send({ type: "command", protocolVersion: 1, id, command: { name: "submit", conversationId, text: `Say ${marker}`, whenBusy: "reject" } });
+  const reply = await client.wait((frame) => frame.type === "reply" && frame.id === id);
+  assert.ok(reply.type === "reply" && reply.ok);
+  await client.wait((frame) => hasText(frame, `Say ${marker}`) && isView(frame) && Object.keys(frame.view.tasks.tasks).length === 0, after);
+}
+
+function assertRuntimeSection(runtime: string, provider: string, modelId: string, workspace: string, databasePath: string): void {
+  assert.ok(runtime.startsWith("<runtime>\n") && runtime.endsWith("\n</runtime>"), "runtime section is default-tagged and self-delimiting");
+  assert.ok(runtime.includes("server host"), "states tools execute on the server host");
+  assert.ok(runtime.includes(`${provider}/${modelId}`), "names the exact configured provider/modelId");
+  assert.ok(runtime.includes(workspace), "names the canonical workspace");
+  assert.ok(runtime.includes(databasePath), "names the canonical database");
+  for (const sidecar of [`${databasePath}-wal`, `${databasePath}-shm`, `${databasePath}.lock`]) {
+    assert.ok(runtime.includes(sidecar), `names sidecar ${sidecar} as server-managed`);
+  }
+  assert.ok(runtime.includes("distinct role"), "separates workspace from durable store roles");
+  assert.ok(runtime.includes("An empty workspace does not mean there is no persisted conversation history"), "clarifies empty workspace vs persisted history");
+  assert.ok(runtime.includes("journalctl --user -u pi-durable-remote.service -n 30 --no-pager"), "includes the qualified service-log guidance");
+  assert.ok(runtime.includes("stdout/stderr of the launching process"), "describes standalone diagnostics");
+  assert.ok(runtime.includes("Do not share logs unredacted"), "warns against sharing unredacted logs");
+  assert.ok(!runtime.includes("authPath") && !runtime.includes("modelsPath"), "contains no auth or model-catalog paths");
+}
 
 const isView = (frame: ServerMessage): frame is Extract<ServerMessage, { type: "snapshot" | "view" }> => frame.type === "snapshot" || frame.type === "view";
 const hasText = (frame: ServerMessage, text: string) => isView(frame) && frame.view.conversation.entries.some((entry) => entry.kind === "pi.assistant" && (entry.model ?? []).some((message) => message.role === "assistant" && message.content.some((block) => block.type === "text" && block.text.includes(text))));
@@ -195,4 +245,72 @@ test("server compromised lease closes sockets and fails closed", { timeout: 10_0
 test("published ModelRuntime bridge can use an injected credential store with no auth file or network", async () => {
   const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
   assert.ok(runtime.getProviders().length > 0);
+});
+
+test("runtime prompt section reports validated configuration and stays stable across submissions and restart", { timeout: 20_000 }, async (t) => {
+  const f = await fixture(t);
+  const contexts: TranscriptContext[] = [];
+  const record = recorder(contexts);
+  f.faux.setResponses([record, record, record]);
+  const server = await f.start();
+  const client = await Probe.connect(server.url, t);
+  const initial = await client.hello();
+  const id = initial.view.conversation.conversation.id;
+
+  await submitAndSettle(client, id, "runtime-1");
+  assert.equal(contexts.length, 1);
+  const canonicalCwd = await realpath(f.cwd);
+  const canonicalDatabase = join(canonicalCwd, "session.sqlite");
+  const first = replaySections(contexts[0]);
+  const runtime = first.runtime;
+  assert.ok(runtime, "runtime section is declared in the leading system prompt");
+  assert.ok(Object.keys(first).includes("preamble"), "untagged preamble is retained as a named section");
+  assert.ok(Object.keys(first).indexOf("runtime") > Object.keys(first).indexOf("preamble"), "runtime follows the preamble");
+  assertRuntimeSection(runtime, f.options.model.provider, f.options.model.modelId, canonicalCwd, canonicalDatabase);
+
+  await submitAndSettle(client, id, "runtime-2");
+  assert.equal(contexts.length, 2);
+  assert.equal(replaySections(contexts[1]).runtime, runtime, "runtime section is identical across settled submissions");
+
+  await client.disconnect();
+  await server.close();
+  const restarted = await f.start();
+  const next = await Probe.connect(restarted.url, t);
+  const restored = await next.hello();
+  assert.equal(restored.view.conversation.conversation.id, id, "conversation identity survives restart");
+  await submitAndSettle(next, id, "runtime-3");
+  assert.equal(contexts.length, 3);
+  assert.equal(replaySections(contexts[2]).runtime, runtime, "runtime section is identical after SQLite reopen");
+  assert.ok(hasText(restored, "ack"), "persisted conversation history remains available");
+  const listing = await readdir(f.cwd);
+  for (const name of listing) {
+    assert.ok(name === "session.sqlite" || name.startsWith("session.sqlite-") || name === "session.sqlite.lock", `workspace holds only storage files, found ${name}`);
+  }
+});
+
+test("runtime prompt section canonicalizes a symlinked workspace with storage outside it", { timeout: 20_000 }, async (t) => {
+  const f = await fixture(t);
+  const outer = await mkdtemp(join(tmpdir(), "durable-runtime-outer-"));
+  t.after(async () => { await rm(outer, { recursive: true, force: true }); });
+  const workspace = join(outer, "workspace");
+  await mkdir(workspace);
+  const link = join(outer, "workspace-link");
+  await symlink(workspace, link);
+  const databasePath = join(outer, "session.sqlite");
+  const contexts: TranscriptContext[] = [];
+  f.faux.setResponses([recorder(contexts)]);
+  const server = await startDurableServer({ ...f.options, cwd: link, databasePath, port: 0 });
+  t.after(() => server.close());
+  const client = await Probe.connect(server.url, t);
+  const initial = await client.hello();
+  await submitAndSettle(client, initial.view.conversation.conversation.id, "runtime-link");
+
+  const canonicalOuter = await realpath(outer);
+  const canonicalWorkspace = join(canonicalOuter, "workspace");
+  const canonicalDatabase = join(canonicalOuter, "session.sqlite");
+  const runtime = replaySections(contexts[0]).runtime;
+  assert.ok(runtime, "runtime section is declared");
+  assertRuntimeSection(runtime, f.options.model.provider, f.options.model.modelId, canonicalWorkspace, canonicalDatabase);
+  assert.ok(!runtime.includes(link), "runtime section never names the symlink path");
+  assert.deepEqual(await readdir(workspace), [], "workspace remains empty while storage lives outside it");
 });
