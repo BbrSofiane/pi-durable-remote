@@ -87,7 +87,87 @@ export const tuiLayoutRoot = (
     { component: help, basis: "auto", maxSize: 2 },
   ]);
 
-export const tuiHelpText = "Enter: follow-up · ^C exit · ^O tools";
+export const tuiHelpText = "Enter: follow-up · /help commands · ^C exit · ^O tools";
+
+/** A handled operator command: the command word recognized and its complete local response text. */
+export type OperatorResponse = { command: "status" | "help" | "model"; text: string };
+
+/**
+ * Deterministic local operator commands: only the exact case-sensitive command words /status, /help and /model,
+ * terminated by end-of-input or whitespace, are handled; every other input — unknown slash words, absolute paths,
+ * argument-bearing /recover or /discard — is ordinary text and returns undefined for literal submission. The helper
+ * is read-only presentation: it sends no command, touches no receipt or editor history, and never throws
+ * NotConnectedError — without a snapshot it reports values unavailable, and with a cached view while
+ * disconnected/connecting/closed it labels those values last-known/stale. Remote strings are sanitized with
+ * terminalText; metadata values are shown in full, never truncated or inferred.
+ */
+const operatorCommandPattern = /^\/(status|help|model)(?=$|\s)/;
+
+export const operatorResponse = (
+  client: Pick<RemoteClient, "state" | "epoch" | "revision" | "views">,
+  input: string,
+): OperatorResponse | undefined => {
+  const match = operatorCommandPattern.exec(input);
+  if (!match) return undefined;
+  const command = match[1] as OperatorResponse["command"];
+  const arguments_ = input.slice(match[0].length).trim();
+  const hint = "Local response · nothing was sent · Esc: close · PageUp/PageDown: scroll";
+  const refuse = (reason: string): OperatorResponse => ({ command, text: `${hint}\n/${command} ${reason}` });
+  if (arguments_.length > 0) return refuse("takes no arguments; the typed text was not sent anywhere");
+  if (command === "help") {
+    return {
+      command,
+      text: [
+        hint,
+        "Local commands (never forwarded to the server):",
+        "/status — connection, configured model, remote cwd/database, work, transport metadata",
+        "/model — shows the configured model; switching is unsupported (server startup only)",
+        "/help — this text",
+        "/recover or /discard — typed alone, resolve the oldest unconfirmed submission",
+        "Keys: Enter submit · ^A abort · ^R resync · ^O tools · Ctrl+Shift+F search · PgUp/PgDn scroll · ^C exit (no abort)",
+        "Recovery receipts are in-memory only: closing the client loses them, recovery never runs",
+        "automatically, and retyping the input creates a new ID that may duplicate work.",
+        "Every other text — including unknown /words and absolute paths — is submitted literally",
+        "to the agent as ordinary input.",
+      ].join("\n"),
+    };
+  }
+  const transport = `Epoch/revision (transport metadata, not durable commit positions): ${client.epoch ? terminalText(client.epoch) : "unavailable"} / ${client.revision >= 0 ? String(client.revision) : "unavailable"}`;
+  if (command === "model") {
+    if (!client.views.hasSnapshot()) return { command, text: `${hint}\nModel: unavailable (no server snapshot received yet)\nSwitching is unsupported: the model is fixed by server startup configuration` };
+    const view = client.views.current();
+    const fresh = client.state === "connected";
+    return {
+      command,
+      text: [
+        hint,
+        `Model (read-only; switching is unsupported)${fresh ? "" : " · last-known/stale cached view"}`,
+        `Configured model: ${terminalText(view.model.provider)}/${terminalText(view.model.modelId)}`,
+        "Model selection happens only in server startup configuration; no command can switch it",
+      ].join("\n"),
+    };
+  }
+  if (!client.views.hasSnapshot()) {
+    return {
+      command,
+      text: [hint, `Status · connection: ${client.state}`, "No server snapshot received yet; live values are unavailable", transport].join("\n"),
+    };
+  }
+  const view = client.views.current();
+  const fresh = client.state === "connected";
+  return {
+    command,
+    text: [
+      hint,
+      `Status · connection: ${client.state}${fresh ? " (fresh snapshot)" : " (last-known/stale cached view)"}`,
+      `Configured model: ${terminalText(view.model.provider)}/${terminalText(view.model.modelId)}`,
+      `Remote cwd: ${terminalText(view.session.cwd)}`,
+      `Remote database: ${terminalText(view.session.databasePath)}`,
+      `Work: ${sessionWorkText(view)}`,
+      transport,
+    ].join("\n"),
+  };
+};
 
 /** Two native Text rows; keep both model and remote basename visible even in narrow terminals. */
 export class RemoteFooter extends Text {
@@ -160,14 +240,36 @@ export function runRemoteTui(client: RemoteClient, terminal: Terminal = new Proc
     draftRevision++;
     tui.requestRender();
   };
-  tui.setLayoutRoot(tuiLayoutRoot(
-    header,
-    new ScrollView(transcript, { follow: "end", primary: true }),
-    recoveries,
-    notices,
-    editor,
-    help,
-  ));
+  const transcriptScroll = new ScrollView(transcript, { follow: "end", primary: true });
+  // A handled operator response temporarily occupies the transcript slot: a native Text inside its own primary
+  // ScrollView, so native PageUp/PageDown page the full retained response while the original transcript ScrollView
+  // (and its scroll state) is merely set aside, not rebuilt. The response is bounded only by its scroll area —
+  // never by the bounded notices component — and every output row is retained for scrolling.
+  const responseView = new Text("", 0, 0);
+  const responseScroll = new ScrollView(responseView, { follow: "none", primary: true });
+  const transcriptRoot = tuiLayoutRoot(header, transcriptScroll, recoveries, notices, editor, help);
+  let responseInput: string | undefined;
+  const refreshResponse = () => {
+    if (responseInput === undefined) return;
+    // Rebuilt from the original input against the current snapshot/state on every update: disconnection turns the
+    // open response visibly stale and reconnection reflects authoritative metadata. Notice churn re-renders but
+    // never erases it. The exact original input (including an argument-bearing usage response) is preserved.
+    responseView.setText(operatorResponse(client, responseInput)?.text ?? "");
+  };
+  const closeResponse = () => {
+    if (responseInput === undefined) return;
+    responseInput = undefined;
+    tui.setLayoutRoot(transcriptRoot);
+    tui.requestRender();
+  };
+  const openResponse = (input: string) => {
+    responseInput = input;
+    responseScroll.scrollTo(0, { disableFollow: true }); // Each new response starts at its beginning.
+    refreshResponse();
+    tui.setLayoutRoot(tuiLayoutRoot(header, responseScroll, recoveries, notices, editor, help));
+    tui.requestRender();
+  };
+  tui.setLayoutRoot(transcriptRoot);
   tui.setFocus(editor);
   let submitting = false;
   let aborting = false;
@@ -175,6 +277,7 @@ export function runRemoteTui(client: RemoteClient, terminal: Terminal = new Proc
   const update = () => {
     updateTuiChrome(client, theme, header, recoveries, notices);
     if (client.views.hasSnapshot()) transcript.update(client.views.current());
+    refreshResponse();
     // Local /recover and /discard must stay submittable in every connection state, so only an in-flight submission
     // disables the editor; the onSubmit guard refuses ordinary input while stale/disconnected and keeps the draft.
     editor.disableSubmit = submitting;
@@ -217,6 +320,12 @@ export function runRemoteTui(client: RemoteClient, terminal: Terminal = new Proc
     // nothing is retained.
     if (text === "/recover") { recoverOldest(); return; }
     if (text === "/discard") { discardOldest(); return; }
+    // Deterministic operator commands: the same rule as /recover and /discard — handled locally before any
+    // submission, receipt provisioning or editor history, in every connection state.
+    const response = operatorResponse(client, text);
+    if (response !== undefined) { openResponse(text); return; }
+    // Ordinary submission restores the transcript; the existing rejection/draft behavior below is unchanged.
+    closeResponse();
     // Freeze this attempt's raw input and post-clear revision: even typing then clearing while a rejection is
     // pending is a newer draft, and must not resurrect this input. Unknown outcomes are never restored.
     const submittedDraft = inputDraft;
@@ -259,6 +368,7 @@ export function runRemoteTui(client: RemoteClient, terminal: Terminal = new Proc
     };
     const stop = () => finish();
     tui.addInputListener((data) => {
+      if (responseInput !== undefined && matchesKey(data, "escape")) { closeResponse(); return { consume: true }; }
       if (matchesKey(data, "ctrl+c")) { stop(); return { consume: true }; }
       if (matchesKey(data, "ctrl+r")) { client.resync(); return { consume: true }; }
       if (matchesKey(data, "ctrl+o")) { transcript.toggleExpanded(); tui.requestRender(); return { consume: true }; }
