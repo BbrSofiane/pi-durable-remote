@@ -1,0 +1,32 @@
+{
+  "name": "pi-durable-remote",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --experimental-strip-types --test packages/protocol/test/*.test.ts packages/server/test/*.test.ts packages/client/test/*.test.ts packages/integration/test/*.test.ts",
+    "server": "node --experimental-strip-types packages/server/src/main.ts",
+    "client": "node --experimental-strip-types packages/client/src/main.ts"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-durable": "1.1.0",
+    "@earendil-works/pi-tui": "1.2.0",
+    "proper-lockfile": "4.1.2",
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.15",
+    "@types/proper-lockfile": "4.1.4",
+    "@types/ws": "8.18.1",
+    "typescript": "5.9.3"
+  }
+}

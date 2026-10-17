@@ -1,0 +1,35 @@
+node_modules/
+dist/
+
+# Credentials and local application state, never public source.
+.env
+.env.*
+*.pem
+*.key
+*.sqlite*
+*.db
+*.db-*
+*.log
+*.jsonl
+/screenshots/
+/sessions/
+/logs/
+/runtime/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+
+# Only the generated Entire bridge belongs to this project's Pi setup.
+/.pi/*
+!/.pi/extensions/
+/.pi/extensions/*
+!/.pi/extensions/entire/
+/.pi/extensions/entire/*
+!/.pi/extensions/entire/index.ts
+
+# Keep local transcripts, metadata and overrides, but never stage them.
+/.entire/*
+!/.entire/.gitignore
+!/.entire/settings.json
