@@ -1,0 +1,69 @@
+# Local terminal client
+
+A project-owned local face for the validated v1 server, using **released** pi-tui 1.2.0 components. Only snapshots/commands cross the boundary: no Harness, model credentials, tools, local workspace reads, edit-preview calculation, or experimental coding-agent imports run here.
+
+Requires Node >=22.19.0 and an interactive terminal for the UI. From the repository root, after `npm install --ignore-scripts --no-audit --no-fund`:
+
+```sh
+# Server must already be running on the VM's loopback port (default 7777).
+npm run client -- --ssh-host sof-sandbox.exe.xyz --remote-port 7777
+
+# Direct loopback WebSocket (local test server, or a tunnel you own/manage):
+npm run client -- --url ws://127.0.0.1:7777/
+
+npm run client -- --help
+npm run check
+npm test
+```
+
+SSH mode is the default. The client allocates an ephemeral loopback local port and owns exactly one `ssh -N -T` child at a time. It sets BatchMode, ConnectTimeout=10, StrictHostKeyChecking=accept-new, ExitOnForwardFailure, keepalives, and disables shared control sockets/masters. It forwards **127.0.0.1 only**, to the VM's 127.0.0.1. SSH authentication must already work without interaction. Startup/reconnect waits for OpenSSH's verbose listener and post-setup interactive-session markers, not a port probe (a pre-existing listener is not our tunnel). Diagnostics are not printed. A failed forward/SSH exit backs off and launches a new owned child; exit tears down only that child, escalating to SIGKILL after two seconds if needed. No existing tunnels or remote services are killed. The readiness marker assumes OpenSSH's standard English debug messages; an incompatible SSH executable fails closed rather than connecting to an unverified port.
+
+Direct mode allows only credential-free loopback `ws://` URLs at `/`. It creates or tears down no SSH processes. No HTTP/web/public transport is introduced.
+
+## UI
+
+- Scrollable transcript with a small You surface, breathing room for native assistant Markdown/Thinking, and one unified block per tool execution (call, committed progress, result/status). Bash shows a literal sanitized `$ command`; read/write/edit show remote paths. Parallel results and reused call IDs are paired within their committed round; unmatched results remain visible. Duration is shown only from committed metadata.
+- **Ctrl+O** toggles all tools between measured-row previews and full original arguments/output/details/diagnostics. Collapsed tools show an omitted-row count and expansion hint, including for long single-line Unicode output. Expansion stays local, preserving draft/cursor/manual scroll and the preference across snapshots/completion/reconnect. `transcriptText` remains full.
+- Compact connection/work/model/remote-path footer near the editor, with string-only remote basename abbreviation, a violet semantic editor border and muted metadata. The palette mirrors the released Pi dark/light themes in a single seam (`theme.ts`): violet accent, green success, yellow warning, warm red error, blue-tinted user surface and restrained green/pending/red tool surfaces. Truecolor terminals get the real okhsl hues via public pi-tui capability detection; the 256-color fallback is deterministic (standard cube/grayscale indices, never terminal-custom 0–15) with measured overrides keeping every paired surface ≥4.5:1. Appearance is a presentation-only guess: `PI_UI_APPEARANCE=light|dark` override, conservative `COLORFGBG` background hint, else dark — no automatic light detection is claimed. The main canvas/assistant prose stay terminal-owned; small user/tool surfaces explicitly pair readable foreground/background colors. `NO_COLOR` removes all UI-added styling while retaining status words/spacing. Routine successful reconnect notices are not permanently displayed; errors/uncertainty and recovery instructions keep full readable styling.
+- Multi-line editor: **Enter** submits a `followUp`; **Shift+Enter** or backslash-Enter inserts a newline. Up/down editor history and pi-tui's regular editing keys apply.
+- **Ctrl+A** requests abort. This v1 server acknowledges only after cancellation drains; it is not an admission-only acknowledgement.
+- **/recover** and **/discard** (typed alone, no arguments) resolve unconfirmed submissions shown in the recovery panel. **/recover** resends the oldest retained submission with its **original request ID and exact original payload**, but only against a fresh connected snapshot of the same persisted session identity; entering the text again instead creates a new request ID and can duplicate work. **/discard** forgets the local in-memory receipt only and never aborts remote work. These inputs are never forwarded to the server, never re-enter the editor history, and refused/repeated attempts keep the receipt.
+- **Ctrl+R** requests a fresh whole snapshot; **PageUp/PageDown** scroll; pi-tui's fullscreen transcript search is available via Ctrl+Shift+F.
+- **Ctrl+C**, SIGINT or SIGTERM exits the local face **without aborting remote work**. The terminal is restored and an owned tunnel is closed.
+- Disconnect/error/reconnect notices are visible. Old state remains labeled stale and submissions are refused (the exact typed draft — whitespace included — is preserved for ordinary re-entry) until a fresh snapshot. Terminal-control sequences in remote payload text are stripped before rendering.
+- Ambiguous submissions (lost reply, disconnect, timeout, ambiguous failure) are retained as **in-memory receipts** and stay visible in a dedicated recovery panel that notice churn cannot erase: the retained count, the oldest target's readiness (from the same eligibility checks `recover()` applies, so identity mismatch/absence and stale snapshots read as refused), its original input preview and request ID, and the original-ID/duplicate-work and local-only-discard instructions. Each panel line is one rendered row even at 36 columns, and the panel never shrinks below its content in height-constrained viewports, so the refused /recover target's preview stays visible. New submissions never silently overwrite receipts. Receipts are bounded (eight, without eviction; further submissions are refused) and die with the client process: closing or restarting the client loses them without aborting remote work.
+
+The presentation stays terminal-native: no nested cards, decorative animation or hidden thinking. Tool previews are bounded; Ctrl+O exposes all retained tool content without client-side data loss. Code blocks wrap to measured columns (including CJK/emoji); their body uses normal foreground, without speculative syntax highlighting. Image payloads remain placeholders. Committed tool details are displayed without local file reads or client-side diff calculation. Remote controls are sanitized before Markdown or trusted styling. Links do not launch URLs or tools; no URL activation callback or local-file autocomplete provider is installed. Native Markdown/Text components are retained across snapshots so unchanged history keeps its parse/width caches. `transcriptText` remains a plain source-like diagnostic helper. The supported v1 server has no model/thinking change command, so model configuration stays in server startup. There is no session picker, local tool runner or extension ecosystem.
+
+## Headless API (same adapter as UI)
+
+```ts
+import { RemoteClient, transcriptText } from "@sof/durable-remote-client";
+
+const client = new RemoteClient({ url: "ws://127.0.0.1:7777/" });
+const unsubscribe = client.views.subscribe(() => {
+  console.log(transcriptText(client.views.current()));
+});
+try {
+  client.start();
+  await client.ready(); // Waits for a whole snapshot, not just WS open.
+  const reply = await client.controller.submit("Inspect the workspace", "reject");
+  console.log(reply.status); // admitted != completed model answer
+  // Keep observing snapshots for tool progress and final outcome.
+} finally {
+  unsubscribe();
+  client.close(); // No abort. For a manually opened OwnedSshTunnel, also await tunnel.close().
+}
+```
+
+`views.current()` throws before the first snapshot. `ready(timeoutMs)` waits for a **fresh connected** snapshot; a previously received value during disconnection is not readiness. `reconnectNow()` invalidates readiness synchronously, so immediately calling `ready()` waits for the replacement connection's snapshot. `views.subscribe()` observes whole replacements. `client.subscribe()` observes transport state/notices. New server epochs replace prior revisions even when lower; older frames in the same epoch are ignored. Resync snapshots may repeat a revision. The conversation/task values are authentic mount payloads, not a claim of one atomic combined storage commit.
+
+`controller.submit(text, whenBusy)` supports `steer`, `followUp` (default), or `reject`; `controller.abort()` waits for completed cancellation. Both take the explicit conversation ID from current state. `NotConnectedError` and local validation errors mean the command was **not sent**. Correlated known rejections throw `CommandRejectedError` (with code/request ID). Disconnect, reply timeout (default 60 seconds), unexpected reply, or ambiguous `COMMAND_FAILED` throw `CommandOutcomeUnknownError`, retaining the generated request ID and exact command. Such commands **may already have taken effect**. The adapter never replays them; timeout/ambiguous failure requests resync, and disconnect reconnects with bounded exponential backoff (250ms to 10s) plus a fresh hello/snapshot. No completed input is reconstructed locally.
+
+For deliberate recovery, inspect fresh state first. The server's deduplication contract requires the **same request ID and identical payload**; entering the text again in the UI makes a new ID and can duplicate work. This UI deliberately does not restore unknown inputs to the editor/history. It retains the exact original intent as an in-memory receipt instead (`client.recovery.list()` / `recover(requestId)` / `discard(requestId)` drive the panel; no automatic replay ever runs, and aborts are never retained). Recovery resends only after a snapshot delivered after the uncertain outcome, refuses a different persisted conversation identity, and keeps the receipt on refused, rejected or still-unknown attempts. Receipts are in-memory only — not durable recovery storage. The public generic `command()` method generates a fresh request ID too, not an idempotent retry. Do not use it to blindly retry an unknown command.
+
+Bounds match the server: 16 MiB incoming snapshots, at most eight local pending commands, 32 KiB UTF-8 submits. All promises returned by the headless API must be handled by its caller; the UI handles its own command failures. View/status observers are synchronous application callbacks and must handle their own failures. Their exceptions propagate unchanged outside wire recovery (following Node's normal fatal behavior when uncaught), rather than being mislabeled malformed frames or triggering a reconnect loop. An oversized session or incompatible protocol cannot be repaired by automatic reconnect alone.
+
+## Deterministic validation
+
+Client tests reuse an actual SQLite/Harness/faux-model server for admission, live tool output, committed partial/final answer, explicit rejection, abort draining, disconnect/reconnect, restart epoch replacement and no-replay recovery. Fault proxies only disturb transport replies; they do not implement another controller. A headless subprocess forbids all file reads/writes/stats after module loading and uses the exported adapter. A fake terminal drives actual pi-tui editor/key handling. `presentation.test.ts` and `toolblocks.test.ts` capture current native TUI frames at 36×20, 80×20 and 100×20 from real Harness/SQLite/faux-model views, including paced committed partials, running tools, errors and stale recovery. To save representative before/after ANSI and plain frames outside the repo, run `PI_UI_FRAME_DIR=/tmp/pi-durable-toolblocks-frames node --experimental-strip-types --test packages/client/test/toolblocks.test.ts packages/client/test/presentation.test.ts packages/integration/test/terminal.test.ts`. Before frames reconstruct the exact pre-redesign Text/theme/layout composition against the same real view; after frames use the production composition. Frame artifacts are diagnostics, not an extra client. They include native current viewports at Markdown, code and tool landmarks, not concatenated writes; recovery-ready/stale and error frames are also captured at both 36 and 80 columns. [DESIGN.md](DESIGN.md) records paired surface styles, preview limits, footer controls and reproducible ANSI/plain evidence. No physical-terminal palette measurement or browser screenshot is claimed. Isolated test-only `ssh` executables in temporary PATHs prove forwarding, SSH-child restart, cleanup, and raced/pre-existing listener refusal; no real SSH connection or model API call occurs in this slice. Current local gates contain 97 ordinary tests (including the 83-test presentation baseline, focused tool-block cases with deterministic native wrapping-cache retention, and palette/contrast regressions) and 12 operational tests. Actual CLI PTY regressions also assert no private cursor APC marker reaches terminal output and the hardware cursor is visible on exit, alongside termios/alternate-screen restoration. Real VM deployment and terminal/SSH smoke for this refresh remain a later authorized slice.

@@ -1,0 +1,30 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { NotConnectedError, RemoteClient } from "../src/index.ts";
+import { fixture } from "../../server/test/helpers.ts";
+
+test("RemoteClient ready immediately after reconnectNow waits for a fresh actual-server snapshot", { timeout: 10_000 }, async (t) => {
+  const f = await fixture(t);
+  const server = await f.start();
+  const client = new RemoteClient({ url: server.url, reconnectMinMs: 20 });
+  t.after(() => client.close());
+  client.start();
+  const previous = await client.ready();
+  const epoch = client.epoch;
+  let replacements = 0;
+  client.views.subscribe(() => { replacements++; });
+  let readyResolved = false;
+  client.reconnectNow();
+  const ready = client.ready().then((view) => { readyResolved = true; return view; });
+  assert.notEqual(client.state, "connected", "readiness must be invalidated synchronously");
+  await Promise.resolve();
+  assert.equal(readyResolved, false, "ready must not resolve the discarded socket's snapshot");
+  await assert.rejects(client.controller.submit("Not on the discarded connection"), NotConnectedError);
+  const fresh = await ready;
+  assert.notEqual(fresh, previous, "a newly received whole snapshot replaces the prior object");
+  assert.deepEqual(fresh, previous, "reconnect preserves the same persistent session");
+  assert.equal(client.epoch, epoch);
+  assert.equal(client.state, "connected");
+  assert.equal(replacements, 1);
+  assert.equal(f.faux.state.callCount, 0);
+});
