@@ -1,0 +1,52 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { access, stat } from "node:fs/promises";
+import { createInterface } from "node:readline";
+import test from "node:test";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { SESSION_LOCK_STALE_MS } from "../src/index.ts";
+import { fixture, Probe, waitUntil } from "./helpers.ts";
+
+// Deliberately kill only our child Node process. This fixture never launches tools/subprocesses.
+test("server SIGKILL leaves a recoverable lease and Harness resumes the admitted input", { timeout: 20_000 }, async (t) => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, ["--experimental-strip-types", new URL("./fixtures/held-server.ts", import.meta.url).pathname, f.cwd, f.databasePath], { stdio: ["ignore", "pipe", "pipe"] });
+  const lines: string[] = [];
+  let stderr = "";
+  child.stderr.on("data", (data) => { stderr += data.toString(); });
+  const reader = createInterface({ input: child.stdout });
+  reader.on("line", (line) => lines.push(line));
+  t.after(() => { child.kill("SIGKILL"); reader.close(); });
+  await waitUntil(() => lines.some((line) => line.startsWith("{")) || child.exitCode !== null);
+  assert.equal(child.exitCode, null, stderr);
+  const ready = JSON.parse(lines.find((line) => line.startsWith("{"))!) as { url: string; epoch: string };
+  const first = await Probe.connect(ready.url, t);
+  const initial = await first.hello();
+  first.send({ type: "command", protocolVersion: 1, id: "crash-request", command: { name: "submit", conversationId: initial.view.conversation.conversation.id, text: "Finish after restart", whenBusy: "reject" } });
+  const admission = await first.wait((frame) => frame.type === "reply" && frame.id === "crash-request");
+  assert.ok(admission.type === "reply" && admission.ok && admission.status === "admitted");
+  await waitUntil(() => lines.includes("model-started"));
+  const exited = new Promise<void>((done) => child.once("exit", () => done()));
+  child.kill("SIGKILL");
+  await exited;
+  const lockPath = `${f.databasePath}.lock`;
+  await access(lockPath);
+  const lockTime = (await stat(lockPath)).mtimeMs;
+  f.faux.setResponses([fauxAssistantMessage("resumed-after-process-death")]);
+  const startedAt = Date.now();
+  const restarted = await f.start();
+  assert.ok(Date.now() > lockTime + SESSION_LOCK_STALE_MS, "only stale lease is reclaimed");
+  assert.ok(Date.now() - startedAt < 8000, "stale acquisition retry is bounded");
+  assert.notEqual(restarted.epoch, ready.epoch);
+  const next = await Probe.connect(restarted.url, t);
+  await next.hello();
+  const final = await next.wait((frame) => (frame.type === "snapshot" || frame.type === "view") &&
+    frame.view.conversation.entries.some((entry) => entry.model?.some((message) => message.role === "assistant" && message.content.some((block) => block.type === "text" && block.text === "resumed-after-process-death"))) && Object.keys(frame.view.tasks.tasks).length === 0);
+  assert.ok(final.type === "snapshot" || final.type === "view");
+  assert.equal(f.faux.state.callCount, 1);
+  next.send({ type: "command", protocolVersion: 1, id: "crash-request", command: { name: "submit", conversationId: initial.view.conversation.conversation.id, text: "Finish after restart", whenBusy: "reject" } });
+  const retried = await next.wait((frame) => frame.type === "reply" && frame.id === "crash-request");
+  assert.ok(retried.type === "reply" && retried.ok && retried.status === "admitted");
+  assert.equal(retried.submissionId, admission.submissionId);
+  assert.equal(f.faux.state.callCount, 1);
+});
